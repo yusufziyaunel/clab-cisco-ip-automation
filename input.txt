@@ -1,0 +1,11 @@
+name: zamazingo
+r1	e0/2	r2	e0/2
+r1	e0/3	r3	e0/1
+r2	e0/3	r3	e0/2
+vr1	e0/2	vr2	e0/1
+vr1	e0/1	vr3	e0/1
+vr2	e0/2	vr3	e0/2
+r1	e0/1	s1	e0/1
+r2	e0/1	s2	e0/1
+vr1	e0/3	vs1	e0/1
+vr2	e0/3	vs3	e0/1
