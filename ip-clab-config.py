@@ -82,15 +82,21 @@ def create_yaml_structure(lab_name, connections):
         if conn['device1'].startswith(('r', 's')):  # IOL cihazları için
             endpoint1 = f"{conn['device1']}:Ethernet{conn['interface1']}"
         else:  # VIOS cihazları için
-            # VIOS için eth0/1 -> eth1 formatına dönüştür
+            # VIOS için eth formatını kullan
             interface_num = conn['interface1'].replace('0/', '')
+            # VIOS switch'leri için sadece 0 ve 1 interface'leri kullan
+            if conn['device1'].startswith('vs') and int(interface_num) > 1:
+                interface_num = '1'  # Sınırlı sayıda interface olduğu için 1'e düşür
             endpoint1 = f"{conn['device1']}:eth{interface_num}"
             
         if conn['device2'].startswith(('r', 's')):  # IOL cihazları için
             endpoint2 = f"{conn['device2']}:Ethernet{conn['interface2']}"
         else:  # VIOS cihazları için
-            # VIOS için eth0/1 -> eth1 formatına dönüştür
+            # VIOS için eth formatını kullan
             interface_num = conn['interface2'].replace('0/', '')
+            # VIOS switch'leri için sadece 0 ve 1 interface'leri kullan
+            if conn['device2'].startswith('vs') and int(interface_num) > 1:
+                interface_num = '1'  # Sınırlı sayıda interface olduğu için 1'e düşür
             endpoint2 = f"{conn['device2']}:eth{interface_num}"
         
         # Endpoints'i doğrudan liste olarak ekle
@@ -116,7 +122,6 @@ def write_yaml_file(yaml_dict, output_filename):
     # YAML dosyasını oluştur
     with open(output_filename, 'w') as file:
         yaml.dump(yaml_dict, file, default_flow_style=False, sort_keys=False)
-
 
 def enrich_inventory(inventory_path):
     # Mevcut inventory'yi oku
@@ -235,7 +240,7 @@ def create_loopback_playbooks():
     
     - name: Display Configuration Summary
       debug:
-        msg: "{{ inventory_hostname.split('-')[-1] }} Loopback Yapılandırması:
+        msg: "{{ inventory_hostname.split('-')[-1] }} Loopback Configuration:
               \\n- Loopback0: {{ '1.1.' if device_type == 'r' else '2.2.' }}{{ device_number }}.1/32
               \\n- Loopback10: {{ '172.16.' if device_type == 'r' else '172.17.' }}{{ device_number }}.1/24"
 """
@@ -283,7 +288,7 @@ def create_loopback_playbooks():
     
     - name: Display Configuration Summary
       debug:
-        msg: "{{ inventory_hostname.split('-')[-1] }} Loopback Yapılandırması:
+        msg: "{{ inventory_hostname.split('-')[-1] }} Loopback Configuration:
               \\n- Loopback0: {{ '3.3.' if device_type == 'vr' else '4.4.' }}{{ device_number }}.1/32
               \\n- Loopback10: {{ '172.18.' if device_type == 'vr' else '172.19.' }}{{ device_number }}.1/24"
 """
@@ -317,13 +322,15 @@ def create_interface_ip_playbooks():
         device_name: "{{ inventory_hostname.split('-')[-1] }}"
         is_router: "{{ inventory_hostname.split('-')[-1].startswith('r') }}"
       no_log: true
+    
     # Switch'ler için tüm interface'leri etkinleştir
     - name: Enable all interfaces on switches
-      cisco.ios.ios_interfaces:
-        config:
-          - name: "{{ item }}"
-            enabled: true
-        state: merged
+      ios_command:
+        commands:
+          - configure terminal
+          - interface {{ item }}
+          - no shutdown
+          - end
       loop:
         - Ethernet0/0
         - Ethernet0/1
@@ -334,63 +341,54 @@ def create_interface_ip_playbooks():
         - Ethernet1/2
         - Ethernet1/3
       when: not is_router
+    
     # Router'lar için interface'leri yapılandır
     - name: Configure router interfaces
-      block:
-        - name: Enable interfaces
-          cisco.ios.ios_interfaces:
-            config:
-              - name: "{{ item.name }}"
-                enabled: true
-            state: merged
-          loop: "{{ interfaces }}"
-          when: interfaces is defined
-          
-        - name: Configure IP addresses
-          cisco.ios.ios_l3_interfaces:
-            config:
-              - name: "{{ item.name }}"
-                ipv4:
-                  - address: "{{ item.ip }}"
-            state: merged
-          loop: "{{ interfaces }}"
-          when: interfaces is defined
-      when: is_router
+      ios_command:
+        commands:
+          - configure terminal
+          - interface {{ item.name }}
+          - ip address {{ item.ip | regex_replace('/30', ' 255.255.255.252') | regex_replace('/28', ' 255.255.255.240') }}
+          - no shutdown
+          - end
+      loop: "{{ interfaces }}"
+      when: is_router and interfaces is defined
+    
     # Yapılandırma sonuçlarını göster
     - name: Show router interface status
-      block:
-        - name: Get interface status
-          ios_command:
-            commands:
-              - show ip interface brief | exclude unassigned
-          register: if_status
-        
-        - name: Display interface summary
-          debug:
-            msg: |
-              {{ device_name }} Interface Yapılandırması:
-              {% for line in if_status.stdout_lines[0] %}
-              {{ line }}
-              {% endfor %}
+      ios_command:
+        commands:
+          - show ip interface brief | exclude unassigned
+      register: if_status
       when: is_router
+    
+    - name: Display interface summary
+      debug:
+        msg: |
+          {{ device_name }} Interface Configuration:
+          {% for line in if_status.stdout_lines[0] %}
+          {{ line }}
+          {% endfor %}
+      when: is_router
+    
     - name: Show switch interface status
-      block:
-        - name: Get interface status
-          ios_command:
-            commands:
-              - show interfaces status | include connected
-          register: if_status
-        
-        - name: Display interface summary
-          debug:
-            msg: |
-              {{ device_name }} Interface Durumu:
-              {% for line in if_status.stdout_lines[0] %}
-              {{ line }}
-              {% endfor %}
+      ios_command:
+        commands:
+          - show interfaces status | include connected
+      register: if_status
+      when: not is_router
+    
+    - name: Display interface summary
+      debug:
+        msg: |
+          {{ device_name }} Interface Status:
+          {% for line in if_status.stdout_lines[0] %}
+          {{ line }}
+          {% endfor %}
       when: not is_router
 """
     
+
     # VIOS cihazları için interface IP playbook - GigabitEthernet formatını kullan
     vios_playbook = """---
 - name: Configure Interface IPs and Status on VIOS Devices
@@ -403,82 +401,72 @@ def create_interface_ip_playbooks():
         device_name: "{{ inventory_hostname.split('-')[-1] }}"
         is_router: "{{ inventory_hostname.split('-')[-1].startswith('vr') }}"
       no_log: true
+    
     # Switch'ler için tüm interface'leri etkinleştir
     - name: Enable all interfaces on switches
-      cisco.ios.ios_interfaces:
-        config:
-          - name: "{{ item }}"
-            enabled: true
-        state: merged
+      ios_command:
+        commands:
+          - configure terminal
+          - interface {{ item }}
+          - no shutdown
+          - end
       loop:
         - GigabitEthernet0/0
         - GigabitEthernet0/1
-        - GigabitEthernet0/2
-        - GigabitEthernet0/3
       when: not is_router
+    
     # Router'lar için interface'leri yapılandır
-    - name: Configure router interfaces
-      block:
-        - name: Convert interface names
-          set_fact:
-            converted_interfaces: "{{ interfaces | map('combine', {'name': 'GigabitEthernet' + item.name.replace('eth', '0/') }) | list }}"
-          loop: "{{ interfaces }}"
-          when: interfaces is defined
-          loop_control:
-            label: "{{ item.name }}"
-          register: conversion_result
-          
-        - name: Enable interfaces
-          cisco.ios.ios_interfaces:
-            config:
-              - name: "{{ item.name }}"
-                enabled: true
-            state: merged
-          loop: "{{ converted_interfaces }}"
-          when: converted_interfaces is defined
-          
-        - name: Configure IP addresses
-          cisco.ios.ios_l3_interfaces:
-            config:
-              - name: "{{ item.name }}"
-                ipv4:
-                  - address: "{{ item.ip }}"
-            state: merged
-          loop: "{{ converted_interfaces }}"
-          when: converted_interfaces is defined
+    - name: Convert interface names for VIOS
+      set_fact:
+        converted_interfaces: "{{ interfaces | map('combine', {'name': 'GigabitEthernet0/' + item.name.replace('eth', '') }) | list }}"
+      loop: "{{ interfaces }}"
       when: is_router and interfaces is defined
+      loop_control:
+        label: "{{ item.name }}"
+      register: conversion_result
+    
+    - name: Configure router interfaces
+      ios_command:
+        commands:
+          - configure terminal
+          - interface {{ item.name }}
+          - ip address {{ item.ip | regex_replace('/30', ' 255.255.255.252') | regex_replace('/28', ' 255.255.255.240') }}
+          - no shutdown
+          - end
+      loop: "{{ converted_interfaces }}"
+      when: is_router and converted_interfaces is defined
+    
     # Yapılandırma sonuçlarını göster
     - name: Show router interface status
-      block:
-        - name: Get interface status
-          ios_command:
-            commands:
-              - show ip interface brief | exclude unassigned
-          register: if_status
-        
-        - name: Display interface summary
-          debug:
-            msg: |
-              {{ device_name }} Interface Yapılandırması:
-              {% for line in if_status.stdout_lines[0] %}
-              {{ line }}
-              {% endfor %}
+      ios_command:
+        commands:
+          - show ip interface brief | exclude unassigned
+      register: if_status
       when: is_router
+    
+    - name: Display interface summary
+      debug:
+        msg: |
+          {{ device_name }} Interface Configuration:
+          {% for line in if_status.stdout_lines[0] %}
+          {{ line }}
+          {% endfor %}
+      when: is_router
+    
     - name: Show switch interface status
-      block:
-        - name: Get interface status
-          ios_command:
-            commands:
-              - show interfaces status | include connected
-          register: if_status
-        
-        - name: Display interface summary
-          debug:
-            msg: |
-              {{ device_name }} Interface Durumu:
-              {% for line in if_status.stdout_lines[0] %}
-              {{ line }}
-              {% endfor %}
+      ios_command:
+        commands:
+          - show interfaces status | include connected
+      register: if_status
+      when: not is_router
+    
+    - name: Display interface summary
+      debug:
+        msg: |
+          {{ device_name }} Interface Status:
+          {% for line in if_status.stdout_lines[0] %}
+          {{ line }}
+          {% endfor %}
       when: not is_router
 """
     
@@ -545,7 +533,7 @@ def save_iol_config(lab_name, inventory_path):
     with open('save_iol_config.yaml', 'w') as file:
         file.write(save_playbook)
     # Save playbook'u çalıştır
-    print("\nKonfigürasyonlar kaydediliyor...")
+    print("\nSaving configurations...")
     result = subprocess.run(
         ['ansible-playbook', '-i', inventory_path, 'save_iol_config.yaml'],
         capture_output=True, 
@@ -553,13 +541,13 @@ def save_iol_config(lab_name, inventory_path):
         env=dict(os.environ, ANSIBLE_DISPLAY_SKIPPED_HOSTS='false')
     )
     if result.returncode == 0:
-        print("Konfigürasyonlar başarıyla kaydedildi")
+        print("Configurations successfully saved")
         # Başarılı kayıt mesajlarını göster
         for line in result.stdout.split('\n'):
             if 'bytes copied' in line:
                 print(line.strip())
     else:
-        print("Konfigürasyon kaydetme sırasında hata oluştu:")
+        print("Error during configuration save:")
         if result.stderr:
             print(result.stderr)
 
@@ -586,7 +574,7 @@ def save_startup_config(lab_name, inventory_path):
     with open('save_config.yaml', 'w') as file:
         file.write(save_playbook)
     # Save playbook'u çalıştır
-    print("\nKonfigürasyonlar kaydediliyor...")
+    print("\nSaving configurations...")
     result = subprocess.run(
         ['ansible-playbook', '-i', inventory_path, 'save_config.yaml'],
         capture_output=True, 
@@ -594,13 +582,13 @@ def save_startup_config(lab_name, inventory_path):
         env=dict(os.environ, ANSIBLE_DISPLAY_SKIPPED_HOSTS='false')
     )
     if result.returncode == 0:
-        print("Konfigürasyonlar başarıyla kaydedildi")
+        print("Configurations successfully saved")
         # Başarılı kayıt mesajlarını göster
         for line in result.stdout.split('\n'):
             if 'bytes copied' in line:
                 print(line.strip())
     else:
-        print("Konfigürasyon kaydetme sırasında hata oluştu:")
+        print("Error during configuration save:")
         if result.stderr:
             print(result.stderr)
            
@@ -744,7 +732,7 @@ def create_network_vars(connections, lab_name):
             yaml.dump(config, f, default_flow_style=False)
     
     # Yapılandırma özetini göster
-    print("\nYapılandırılacak interface IP'leri:")
+    print("\nInterface IPs to be configured:")
     
     # Switch gruplarını göster
     switch_groups = {}
@@ -768,13 +756,13 @@ def create_network_vars(connections, lab_name):
                         'ip': interface['ip']
                     })
     
-    print("\nSwitch grupları:")
+    print("\nSwitch groups:")
     for switch, configs in sorted(switch_groups.items()):
         if switch.startswith('vs'):
             switch_id = 100 + int(switch[2:])
         else:
             switch_id = int(switch[1:])
-        print(f"\n{switch} grubu (192.168.{switch_id}.0/28):")
+        print(f"\n{switch} group (192.168.{switch_id}.0/28):")
         for config in sorted(configs, key=lambda x: x['device']):
             print(f"  {config['device']}({config['interface']}): {config['ip']}")
     
@@ -797,7 +785,7 @@ def create_network_vars(connections, lab_name):
                         'device2': interface['connected_to'],
                     })
     
-    print("\nRouter-Router bağlantıları:")
+    print("\nRouter-Router connections:")
     processed_links = set()
     for link in sorted(router_links, key=lambda x: (x['device1'], x['device2'])):
         link_key = tuple(sorted([link['device1'], link['device2']]))
@@ -819,7 +807,7 @@ def deploy_lab(yaml_file, lab_name, connections, reconfigure=False):
         config_dir = "config"
         if not os.path.exists(config_dir):
             os.makedirs(config_dir)
-            print(f"'{config_dir}' dizini oluşturuldu")
+            print(f"'{config_dir}' directory created")
         
         # YAML dosyasını oku
         with open(yaml_file, 'r') as file:
@@ -839,7 +827,7 @@ def deploy_lab(yaml_file, lab_name, connections, reconfigure=False):
                             
                             # Dosya yoksa oluştur
                             if not os.path.exists(cfg_file):
-                                print(f"Boş yapılandırma dosyası oluşturuluyor: {cfg_file}")
+                                print(f"Creating empty configuration file: {cfg_file}")
                                 with open(cfg_file, 'w') as f:
                                     # Temel yapılandırma ekle
                                     f.write("hostname " + device_name + "\n")
@@ -861,7 +849,7 @@ def deploy_lab(yaml_file, lab_name, connections, reconfigure=False):
         else:
             subprocess.run(['containerlab', 'deploy', '-t', yaml_file], check=True)
         
-        print(f"Lab başarıyla deploy edildi: {lab_name}")
+        print(f"Lab successfully deployed: {lab_name}")
         
         # Inventory dosyasının oluşmasını bekle
         inventory_path = f"clab-{lab_name}/ansible-inventory.yml"
@@ -873,26 +861,26 @@ def deploy_lab(yaml_file, lab_name, connections, reconfigure=False):
         
         if os.path.exists(inventory_path):
             # Inventory dosyasını zenginleştir
-            print(f"Inventory dosyası bulundu: {inventory_path}")
+            print(f"Inventory file found: {inventory_path}")
             time.sleep(2)  # Dosyanın tamamen yazılmasını bekle
             enrich_inventory(inventory_path)
-            print("Inventory dosyası zenginleştirildi")
+            print("Inventory file enriched")
             
             # Loopback playbook'u oluştur
             create_loopback_playbooks()
-            print("Loopback playbook'ları oluşturuldu")
+            print("Loopback playbooks created")
             
             # Interface IP playbook'u oluştur
             create_interface_ip_playbooks()
-            print("Interface IP playbook'ları oluşturuldu")
+            print("Interface IP playbooks created")
             
             # Save config playbook'u oluştur
             create_save_config_playbooks()
-            print("Save config playbook oluşturuldu")
+            print("Save config playbook created")
             
             # Network yapılandırma değişkenlerini oluştur
             create_network_vars(connections, lab_name)
-            print("Network yapılandırma değişkenleri oluşturuldu")
+            print("Network configuration variables created")
             
             # VIOS cihazları var mı kontrol et
             has_vios = False
@@ -902,7 +890,7 @@ def deploy_lab(yaml_file, lab_name, connections, reconfigure=False):
                     has_vios = True
             
             # Cihazların hazır olmasını bekle
-            print("Cihazların hazır olması bekleniyor...")
+            print("Waiting for devices to be ready...")
             
             # IOL cihazları için bekleme
             max_attempts = 20
@@ -916,17 +904,17 @@ def deploy_lab(yaml_file, lab_name, connections, reconfigure=False):
                     )
                     
                     if result_iol.returncode == 0:
-                        print("IOL cihazları hazır!")
+                        print("IOL devices ready!")
                         break
                     
-                    print(f"Deneme {attempt + 1}/{max_attempts}... IOL cihazları henüz hazır değil.")
+                    print(f"Attempt {attempt + 1}/{max_attempts}... IOL devices not ready yet.")
                     time.sleep(10)
                 except Exception as e:
-                    print(f"Ping sırasında hata: {e}")
+                    print(f"Error during ping: {e}")
                     time.sleep(10)
             
             # Loopback yapılandırmasını uygula - Sadece IOL cihazları için
-            print("\nIOL cihazları için Loopback yapılandırması uygulanıyor...")
+            print("\nApplying Loopback configuration for IOL devices...")
             print("-" * 50)
             result = subprocess.run(
                 ['ansible-playbook', '-i', inventory_path, 'loopback_iol.yaml'],
@@ -937,16 +925,16 @@ def deploy_lab(yaml_file, lab_name, connections, reconfigure=False):
             if result.returncode == 0:
                 # Sadece yapılandırma özetini göster
                 for line in result.stdout.split('\n'):
-                    if "Loopback Yapılandırması" in line:
+                    if "Loopback Configuration" in line:
                         print(line.replace('\\n', '\n').replace('msg:', '').strip())
                 print("-" * 50)
-                print("IOL cihazları için Loopback yapılandırması başarıyla tamamlandı")
+                print("Loopback configuration for IOL devices successfully completed")
             else:
-                print("Loopback yapılandırması sırasında hata oluştu:")
+                print("Error during Loopback configuration:")
                 print(result.stderr)
                 
             # Interface IP'lerini yapılandır - Sadece IOL cihazları için
-            print("\nIOL cihazları için Interface IP'leri yapılandırılıyor...")
+            print("\nConfiguring Interface IPs for IOL devices...")
             result = subprocess.run(
                 ['ansible-playbook', '-i', inventory_path, 'interface_ip_iol.yaml'],
                 capture_output=True,
@@ -956,34 +944,103 @@ def deploy_lab(yaml_file, lab_name, connections, reconfigure=False):
             
             # Interface IP çıktılarını işle
             if result.returncode == 0:
-                print("\nIOL cihazları için Interface IP yapılandırması başarıyla tamamlandı")
+                print("\nInterface IP configuration for IOL devices successfully completed")
                 
                 # Konfigürasyonu kaydet - Sadece IOL cihazları için
-                print("\nIOL cihazları için konfigürasyonlar kaydediliyor...")
+                print("\nSaving configurations for IOL devices...")
                 save_iol_config(lab_name, inventory_path)
             else:
-                print("\nInterface IP yapılandırması sırasında hata oluştu:")
+                print("\nError during Interface IP configuration:")
                 print(result.stderr)
             
-            # VIOS cihazları için bilgilendirme mesajı
+            # VIOS cihazları için bekleme ve yapılandırma
             if has_vios:
                 print("\n" + "=" * 80)
-                print("NOT: VIOS cihazları (vr1, vr2, vs1, vs2, ...) daha uzun sürede başlar.")
-                print("Bu cihazlar için yapılandırma, cihazlar tamamen başladıktan sonra")
-                print("aşağıdaki komutlarla manuel olarak yapılabilir:")
-                print("\n# VIOS cihazları için Loopback yapılandırması:")
-                print(f"ansible-playbook -i {inventory_path} loopback_vios.yaml")
-                print("\n# VIOS cihazları için Interface IP yapılandırması:")
-                print(f"ansible-playbook -i {inventory_path} interface_ip_vios.yaml")
-                print("\n# VIOS cihazları için konfigürasyonları kaydetme:")
-                print(f"ansible-playbook -i {inventory_path} save_config.yaml --limit cisco_vios")
+                print("Waiting for VIOS devices to start (3 minutes)...")
                 print("=" * 80)
+                
+                # 3 dakika bekle
+                time.sleep(180)
+                
+                # VIOS cihazlarının hazır olup olmadığını kontrol et
+                try:
+                    result_vios = subprocess.run(
+                        ['ansible', 'cisco_vios', '-i', inventory_path, '-m', 'ping'],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if result_vios.returncode == 0:
+                        print("VIOS devices ready!")
+                        
+                        # Loopback yapılandırmasını uygula - VIOS cihazları için
+                        print("\nApplying Loopback configuration for VIOS devices...")
+                        print("-" * 50)
+                        result = subprocess.run(
+                            ['ansible-playbook', '-i', inventory_path, 'loopback_vios.yaml'],
+                            capture_output=True,
+                            text=True,
+                            env=dict(os.environ, ANSIBLE_DISPLAY_SKIPPED_HOSTS='false')
+                        )
+                        if result.returncode == 0:
+                            # Sadece yapılandırma özetini göster
+                            for line in result.stdout.split('\n'):
+                                if "Loopback Configuration" in line:
+                                    print(line.replace('\\n', '\n').replace('msg:', '').strip())
+                            print("-" * 50)
+                            print("Loopback configuration for VIOS devices successfully completed")
+                        else:
+                            print("Error during VIOS Loopback configuration:")
+                            print(result.stderr)
+                            
+                        # Interface IP'lerini yapılandır - VIOS cihazları için
+                        print("\nConfiguring Interface IPs for VIOS devices...")
+                        result = subprocess.run(
+                            ['ansible-playbook', '-i', inventory_path, 'interface_ip_vios.yaml'],
+                            capture_output=True,
+                            text=True,
+                            env=dict(os.environ, ANSIBLE_DISPLAY_SKIPPED_HOSTS='false')
+                        )
+                        
+                        # Interface IP çıktılarını işle
+                        if result.returncode == 0:
+                            print("\nInterface IP configuration for VIOS devices successfully completed")
+                            
+                            # Konfigürasyonu kaydet - VIOS cihazları için
+                            print("\nSaving configurations for VIOS devices...")
+                            result = subprocess.run(
+                                ['ansible-playbook', '-i', inventory_path, 'save_config.yaml', '--limit', 'cisco_vios'],
+                                capture_output=True,
+                                text=True,
+                                env=dict(os.environ, ANSIBLE_DISPLAY_SKIPPED_HOSTS='false')
+                            )
+                            if result.returncode == 0:
+                                print("VIOS configurations successfully saved")
+                            else:
+                                print("Error during VIOS configuration save:")
+                                print(result.stderr)
+                        else:
+                            print("\nError during VIOS Interface IP configuration:")
+                            print(result.stderr)
+                    else:
+                        print("VIOS devices still not ready after 3 minutes. You may need to configure them manually.")
+                        print("\nManual configuration commands:")
+                        print(f"ansible-playbook -i {inventory_path} loopback_vios.yaml")
+                        print(f"ansible-playbook -i {inventory_path} interface_ip_vios.yaml")
+                        print(f"ansible-playbook -i {inventory_path} save_config.yaml --limit cisco_vios")
+                except Exception as e:
+                    print(f"Error during VIOS ping: {e}")
+                    print("You may need to configure them manually.")
+                    print("\nManual configuration commands:")
+                    print(f"ansible-playbook -i {inventory_path} loopback_vios.yaml")
+                    print(f"ansible-playbook -i {inventory_path} interface_ip_vios.yaml")
+                    print(f"ansible-playbook -i {inventory_path} save_config.yaml --limit cisco_vios")
         else:
-            print("Inventory dosyası bulunamadı")
+            print("Inventory file not found")
     except subprocess.CalledProcessError as e:
-        print(f"Lab deploy edilirken hata oluştu: {e}")
+        print(f"Error deploying lab: {e}")
     except Exception as e:
-        print(f"Beklenmeyen bir hata oluştu: {e}")
+        print(f"Unexpected error: {e}")
 
 def create_ansible_cfg():
     config = """[defaults]
@@ -992,7 +1049,6 @@ host_key_checking = False
 timeout = 60
 deprecation_warnings = False
 interpreter_python = auto_silent
-
 [persistent_connection]
 command_timeout = 60
 connect_timeout = 60
@@ -1013,7 +1069,7 @@ def main():
     yaml_dict = create_yaml_structure(lab_name, connections)
     # YAML dosyasını yaz
     write_yaml_file(yaml_dict, output_filename)
-    print(f"YAML dosyası başarıyla oluşturuldu: {output_filename}")
+    print(f"YAML file successfully created: {output_filename}")
     
     # Lab'ı deploy et ve inventory'yi zenginleştir
     # Eğer lab zaten varsa, reconfigure=True ile çağırın
